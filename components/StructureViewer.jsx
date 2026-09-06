@@ -1,38 +1,69 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { parseMcstructureFile } from "../lib/parseMcstructure";
 import { colorForBlock } from "../lib/blockColors";
+import {
+  loadBlockTextureAtlas,
+  buildTexturedBoxGeometry,
+} from "../lib/blockTextures";
 
-// Renders every block as one instance of a shared cube mesh. This matters:
-// a naive <mesh> per block falls over well before a few thousand blocks,
-// while InstancedMesh handles tens of thousands in a single draw call.
-function InstancedBlocks({ blocks, size }) {
+function centerOffset(size) {
+  return { x: -size.x / 2, y: -size.y / 2, z: -size.z / 2 };
+}
+
+// One InstancedMesh per block type that has real textures resolved, sharing
+// a single atlas texture but each with its own UV-mapped cube geometry.
+function TexturedBlockGroup({ blocks, size, faceUVs, atlasTexture }) {
   const meshRef = useRef();
+  const geometry = useMemo(() => buildTexturedBoxGeometry(faceUVs), [faceUVs]);
 
   useEffect(() => {
     if (!meshRef.current) return;
-
     const dummy = new THREE.Object3D();
-    const color = new THREE.Color();
-
-    // Center the structure on the origin so OrbitControls orbits its middle.
-    const offsetX = -size.x / 2;
-    const offsetY = -size.y / 2;
-    const offsetZ = -size.z / 2;
-
+    const offset = centerOffset(size);
     blocks.forEach((block, i) => {
       dummy.position.set(
-        block.x + offsetX,
-        block.y + offsetY,
-        block.z + offsetZ
+        block.x + offset.x,
+        block.y + offset.y,
+        block.z + offset.z
       );
       dummy.updateMatrix();
       meshRef.current.setMatrixAt(i, dummy.matrix);
+    });
+    meshRef.current.instanceMatrix.needsUpdate = true;
+  }, [blocks, size]);
 
+  return (
+    <instancedMesh ref={meshRef} args={[geometry, undefined, blocks.length]}>
+      <meshStandardMaterial map={atlasTexture} />
+    </instancedMesh>
+  );
+}
+
+// Flat-colored fallback for anything we couldn't map to a real texture
+// (unmapped block names, fetch failures, no network access, etc.) - and the
+// only path used at all until textures finish loading.
+function FallbackColorBlocks({ blocks, size }) {
+  const meshRef = useRef();
+
+  useEffect(() => {
+    if (!meshRef.current || blocks.length === 0) return;
+    const dummy = new THREE.Object3D();
+    const color = new THREE.Color();
+    const offset = centerOffset(size);
+
+    blocks.forEach((block, i) => {
+      dummy.position.set(
+        block.x + offset.x,
+        block.y + offset.y,
+        block.z + offset.z
+      );
+      dummy.updateMatrix();
+      meshRef.current.setMatrixAt(i, dummy.matrix);
       color.set(colorForBlock(block.name));
       meshRef.current.setColorAt(i, color);
     });
@@ -43,11 +74,10 @@ function InstancedBlocks({ blocks, size }) {
     }
   }, [blocks, size]);
 
+  if (blocks.length === 0) return null;
+
   return (
-    <instancedMesh
-      ref={meshRef}
-      args={[undefined, undefined, blocks.length]}
-    >
+    <instancedMesh ref={meshRef} args={[undefined, undefined, blocks.length]}>
       <boxGeometry args={[1, 1, 1]} />
       <meshStandardMaterial />
     </instancedMesh>
@@ -58,18 +88,32 @@ export default function StructureViewer() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [textureAssets, setTextureAssets] = useState(null);
+  const [texturesLoading, setTexturesLoading] = useState(false);
 
   async function handleFile(file) {
     setLoading(true);
     setError(null);
     setData(null);
+    setTextureAssets(null);
     try {
       const arrayBuffer = await file.arrayBuffer();
       const parsed = await parseMcstructureFile(arrayBuffer);
       if (parsed.blocks.length === 0) {
         setError("Parsed the file, but found no blocks to render.");
-      } else {
-        setData(parsed);
+        return;
+      }
+      setData(parsed);
+
+      setTexturesLoading(true);
+      try {
+        const uniqueNames = [...new Set(parsed.blocks.map((b) => b.name))];
+        const assets = await loadBlockTextureAtlas(uniqueNames);
+        setTextureAssets(assets);
+      } catch (textureErr) {
+        console.error("Falling back to flat colors:", textureErr);
+      } finally {
+        setTexturesLoading(false);
       }
     } catch (err) {
       console.error(err);
@@ -80,6 +124,31 @@ export default function StructureViewer() {
       setLoading(false);
     }
   }
+
+  const groupedByName = useMemo(() => {
+    if (!data) return null;
+    const map = new Map();
+    data.blocks.forEach((b) => {
+      if (!map.has(b.name)) map.set(b.name, []);
+      map.get(b.name).push(b);
+    });
+    return map;
+  }, [data]);
+
+  const fallbackBlocks = useMemo(() => {
+    if (!data) return [];
+    if (!textureAssets) return data.blocks;
+    return data.blocks.filter(
+      (b) => !textureAssets.faceUVByBlock.has(b.name)
+    );
+  }, [data, textureAssets]);
+
+  const texturedEntries = useMemo(() => {
+    if (!groupedByName || !textureAssets) return [];
+    return Array.from(groupedByName.entries()).filter(([name]) =>
+      textureAssets.faceUVByBlock.has(name)
+    );
+  }, [groupedByName, textureAssets]);
 
   return (
     <div style={{ width: "100%", height: "100vh", position: "relative" }}>
@@ -106,17 +175,36 @@ export default function StructureViewer() {
             {data.size.y}×{data.size.z}
           </p>
         )}
+        {texturesLoading && <p>Loading textures from bedrock-samples…</p>}
+        {data && textureAssets && (
+          <p>
+            {(data.blocks.length - fallbackBlocks.length).toLocaleString()}{" "}
+            blocks textured · {fallbackBlocks.length.toLocaleString()} shown
+            as color
+          </p>
+        )}
       </div>
 
       <Canvas camera={{ position: [20, 20, 20], fov: 50 }}>
         <ambientLight intensity={0.6} />
         <directionalLight position={[10, 20, 10]} intensity={1} />
         {data && (
-          <InstancedBlocks
-            key={data.blocks.length}
-            blocks={data.blocks}
-            size={data.size}
-          />
+          <>
+            {texturedEntries.map(([name, blocksForName]) => (
+              <TexturedBlockGroup
+                key={name}
+                blocks={blocksForName}
+                size={data.size}
+                faceUVs={textureAssets.faceUVByBlock.get(name)}
+                atlasTexture={textureAssets.atlasTexture}
+              />
+            ))}
+            <FallbackColorBlocks
+              key={`fallback-${fallbackBlocks.length}-${texturesLoading}`}
+              blocks={fallbackBlocks}
+              size={data.size}
+            />
+          </>
         )}
         <OrbitControls />
       </Canvas>

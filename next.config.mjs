@@ -1,11 +1,6 @@
-import webpack from "webpack";
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  webpack: (config) => {
-    // prismarine-nbt was written for Node, so the browser bundle needs a
-    // Buffer polyfill. Without this, parsing fails silently in the browser
-    // even though it works fine in a Node script.
+  webpack: (config, { webpack }) => {
     config.resolve.fallback = {
       ...config.resolve.fallback,
       buffer: "buffer",
