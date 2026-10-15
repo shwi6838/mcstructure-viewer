@@ -1,0 +1,20 @@
+mcstructure viewer/
+├── .next/
+├── app/
+│   ├── viewer/
+│   │   └── page.js        - entry
+│   ├── layout.js
+│   └── page.js
+├── components/
+│   └── StructureViewer.jsx
+├── lib/
+│   ├── blockColors.js
+│   ├── blockShapes.js
+│   ├── blockTextures.js
+│   └── parseMcstructure.js
+├── node_modules/
+├── .gitignore
+├── next.config.mjs
+├── package-lock.json
+├── package.json
+└── README.md

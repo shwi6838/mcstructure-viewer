@@ -1,0 +1,229 @@
+PLANNING NOTES - mcstructure viewer
+===================================
+
+Working notes for upcoming goals. Nothing here is implemented yet.
+The README carries the short, public-facing version of these goals.
+
+
+1. OVERALL SHAPE
+----------------
+
+One codebase, two parts built on a shared core:
+
+  A) Workshop (local Next.js app)
+     Where a builder uploads, inspects, and catalogues structures:
+       - upload .mcstructure files and preview them
+       - stats (block count, dimensions, textured vs. color)
+       - untextured block checks
+       - texture uploads (modded / resource-pack textures)
+       - a gallery of saved builds
+
+  B) Embeddable viewer (npm package)
+     - native React export, for use with npm and React
+     - <mcbe-structure-viewer> web component, for use with a script/CDN tag
+       on any site
+
+Shared pieces
+  - lib/                        shared core engine (parsing, textures, shapes,
+                                colors) used by the workshop AND the component
+  - components/StructureViewer  shared React component used by both
+
+Intended workflow
+  upload and debug in the workshop (adding extra textures if needed) ->
+  confirm it renders well and see what is unsupported -> embed the package
+  on a site once the structure is known to work.
+
+
+2. SHARED CORE AND COMPONENT
+----------------------------
+
+  - lib/ stays framework-agnostic: no Next.js imports, no UI. It should
+    accept inputs (a structure file, optional extra texture sources) and
+    return data (parsed blocks, atlas, UV lookups).
+  - components/StructureViewer.jsx is the single React viewer. The workshop
+    wraps it with its own panels (upload, stats, untextured list, gallery);
+    the embeddable build exposes it with a minimal, optional UI.
+  - Container-based sizing (fill the parent), not 100vh.
+  - Auto-framing of the camera to the structure's bounding box becomes a
+    prerequisite, since embeds come in many sizes.
+
+
+3. PACKAGE ENTRY POINTS AND BUILD
+---------------------------------
+
+Entry files
+  - index.js           native React export. For npm + React projects that
+                       import the component directly.
+  - web-component.js   wraps the React component with @r2wc/react-to-web-
+                       component and registers <mcbe-structure-viewer>
+                       (Shadow DOM). For script/CDN tags on any site.
+
+Build config
+  - One Vite config (vite.config.js is the conventional filename) that builds
+    both entry points in library mode:
+      * React build (index.js): React, ReactDOM, three, @react-three/fiber,
+        and @react-three/drei are EXTERNAL (peer dependencies), so a host
+        that already uses them does not get duplicate copies.
+      * Web component build (web-component.js): fully self-contained. Bundles
+        everything (React, three, R3F, drei, prismarine-nbt, Buffer
+        polyfill), output as an ES module and an IIFE for plain <script> tags.
+  - Package.json "exports" maps the entries (React build, web component,
+    types if added); peerDependencies lists the externalized libraries.
+
+Naming (decided)
+  - Element: <mcbe-structure-viewer>
+  - "Minecraft" is deliberately left out of element and package names
+    (Mojang's brand guidelines restrict that use). npm package name should
+    follow the same convention (e.g. mcbe-structure-viewer); check
+    availability and whether to use a scope.
+
+Candidate attributes / props (to be decided)
+  src              URL of a .mcstructure file the site host serves
+  preset           Name of a built-in library structure (if presets are kept)
+  auto-rotate      Slowly orbit the structure
+  controls         Toggle orbit controls / UI
+  background       Canvas background color or transparent
+  texture-source   Override the bedrock-samples URL (e.g. a pinned tag)
+  Events           load, error, and similar custom events
+  Methods          e.g. loadFile(file), loadResourcePack(file)
+
+Bundle size
+  - Heavy parts: three.js, R3F, drei, prismarine-nbt. Consider importing only
+    OrbitControls from drei (or a lighter orbit implementation) and lazy-
+    loading the parser and textures.
+  - Verify pointer events, OrbitControls, and resize inside a shadow root.
+
+
+4. WORKSHOP (LOCAL NEXT.JS APP)
+-------------------------------
+
+Pages
+  - Home (app/page.js): gallery of saved builds.
+  - Viewer (app/viewer/page.js): full debug view with file input, stats panel,
+    untextured list, and texture uploads.
+
+Features
+  - Upload and preview .mcstructure files.
+  - Stats and untextured block report per build, to judge whether a build is
+    "ready to embed".
+  - Texture uploads: let the user add modded/custom textures (see section 6).
+  - Gallery with saved builds (name, notes, date, thumbnail captured from the
+    canvas).
+  - "Copy embed code" button that generates the <mcbe-structure-viewer>
+    snippet (or React usage) for the current build.
+
+Gallery storage (decided)
+  - IndexedDB (far larger limits than localStorage, handles binary files).
+  - Stores: the structure file, metadata, thumbnail, and any user-uploaded
+    texture packs associated with the build.
+  - Later: optional cloud sync so users can share and publish builds.
+    Because of the hosting rules in section 7, anything published to a server
+    must be limited to the user's own structure files and metadata, never
+    resource-pack or other third-party texture assets.
+
+
+5. DATA FLOW SUMMARY
+--------------------
+
+  Workshop:
+    user's computer -> browser (IndexedDB, in-memory) -> viewer
+    Structure files and uploaded texture packs stay local to the user's
+    browser.
+
+  Web component on a third-party site:
+    site owner hosts the .mcstructure file(s) themselves (src attribute).
+    Visitors who want modded/custom textures load their own resource/addon
+    pack in their own browser; it is processed locally and not uploaded
+    anywhere.
+    Vanilla textures are fetched at runtime from Mojang/bedrock-samples
+    (main branch, intentional so updates are picked up).
+
+
+6. MODDED BLOCKS AND CUSTOM TEXTURES
+------------------------------------
+
+Texture uploads (workshop, and optionally the component)
+  - Accept a resource/addon pack (zip or folder) and read its
+    blocks.json / terrain_texture.json / textures/ so uploaded textures
+    override or extend the vanilla lookup from bedrock-samples.
+  - Lookup order idea: user-supplied pack -> vanilla bedrock-samples ->
+    placeholder.
+  - Uploads are read in the browser only (local files), never sent to a
+    server by this project.
+
+Placeholders for modded/unknown blocks
+  - Today unresolved blocks already render as flat-colored cubes, with a
+    deterministic hashed color per block name (lib/blockColors.js).
+  - Goal: a clear, generic placeholder for blocks with no texture anywhere,
+    so modded blocks are visible and distinguishable instead of looking like
+    vanilla blocks.
+  - "Color reader" idea (to confirm): when a pack provides a texture but no
+    full model is available, sample the texture's average color to tint the
+    placeholder; with no texture at all, fall back to the hashed color.
+  - Untextured list in the workshop doubles as a checklist of what still
+    needs a pack or a mapping.
+
+
+7. HOSTING AND LEGAL BOUNDARIES (DESIGN RULES)
+----------------------------------------------
+
+Design rule: this project never hosts or redistributes Mojang textures or
+third-party resource/addon packs.
+
+  - Workshop: users upload their own files locally; processed in the
+    browser. Local use only.
+  - Web component: site owners host their own structure files. Visitors load
+    their own resource/addon packs on their own machine if they want them.
+  - Preset library (if kept): only builds that the author made or has
+    permission to share, with the license stated. Presets should rely on
+    vanilla textures fetched from bedrock-samples, not bundled pack art.
+  - Cloud sharing (future): structures and metadata only; no pack textures.
+
+Licensing tasks before publishing (confirm details against the actual
+licenses/terms rather than assuming):
+  - Choose a package license (MIT is a common default for libraries) and add
+    a LICENSE file.
+  - Read the Mojang/bedrock-samples license and Mojang's usage guidelines to
+    confirm what runtime fetching of vanilla textures allows.
+  - Add attribution and a "not affiliated with or endorsed by Mojang or
+    Microsoft" disclaimer to the README and package metadata.
+  - Audit bundled dependency licenses (three.js, R3F, drei, prismarine-nbt,
+    and transitive deps), since the web component bundle inlines them.
+
+
+8. OPEN QUESTIONS
+-----------------
+
+  - Repo layout: single package with extra entry files, or a workspace
+    (npm workspaces) with the library and the workshop as separate packages.
+  - Where index.js, web-component.js, and vite.config.js live relative to
+    the Next.js app (repo root, or a dedicated package folder).
+  - Final meaning of "color reader" for modded blocks (see section 6).
+  - Resource-pack handling details: zip vs folder upload, how to merge
+    multiple packs, and how to handle packs that define custom block models
+    or geometry (likely out of scope at first).
+  - Whether the component UI includes a "load resource pack" control or only
+    exposes loadResourcePack() programmatically.
+  - Whether presets are still wanted now that site owners host their own
+    structure files, and if so where they are hosted.
+  - npm package name and scope availability.
+  - Where to host the IIFE bundle (static site, GitHub Pages, or a CDN that
+    serves npm packages such as jsDelivr/unpkg).
+  - Cloud sharing design (accounts, storage, moderation) - future.
+
+
+9. SUGGESTED ORDER OF WORK
+--------------------------
+
+  1. Auto-frame the camera to the structure's bounding box.
+  2. Make lib/ and StructureViewer fully framework-agnostic and container-
+     sized; split workshop-only UI (stats, untextured list) out of the shared
+     component.
+  3. Add texture-pack loading to lib/blockTextures.js (user pack overrides
+     vanilla), and the placeholder/color logic for unknown blocks.
+  4. Workshop: texture upload UI and IndexedDB gallery with thumbnails.
+  5. Create index.js and web-component.js, and the dual-build vite.config.js
+     (externalized peers for the React build, self-contained web component).
+  6. Test the web component inside Shadow DOM on a plain HTML page.
+  7. Licensing review, README attribution, publish to npm.
+  8. Later: cloud sharing.
