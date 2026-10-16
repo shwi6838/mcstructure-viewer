@@ -215,15 +215,218 @@ licenses/terms rather than assuming):
 9. SUGGESTED ORDER OF WORK
 --------------------------
 
-  1. Auto-frame the camera to the structure's bounding box.
-  2. Make lib/ and StructureViewer fully framework-agnostic and container-
+  1. [DONE] Auto-frame the camera to the structure's bounding box.
+  2. [DONE] Make lib/ and StructureViewer framework-agnostic and container-
      sized; split workshop-only UI (stats, untextured list) out of the shared
-     component.
-  3. Add texture-pack loading to lib/blockTextures.js (user pack overrides
-     vanilla), and the placeholder/color logic for unknown blocks.
-  4. Workshop: texture upload UI and IndexedDB gallery with thumbnails.
-  5. Create index.js and web-component.js, and the dual-build vite.config.js
+     component. (lib/structureLayout.js holds the shared layout/grouping
+     logic; components/ViewerWorkshop.jsx holds the workshop UI.)
+  3. [DEFERRED - out of scope for now] Texture-pack loading and the
+     placeholder/color logic for unknown blocks (see section 6).
+  4. Block geometry from data (section 10): generator script, vendored
+     lookup, collision-box shapes with hand-coded fallbacks. Start with
+     stairs, slabs, trapdoors as a proof.
+  5. Layer slicing ("plan mode") in the workshop viewer (section 11).
+  6. Rendering-accuracy backlog (section 10), in priority order.
+  7. Workshop: IndexedDB gallery with thumbnails (texture upload UI waits on
+     step 3).
+  8. Create index.js and web-component.js, and the dual-build vite.config.js
      (externalized peers for the React build, self-contained web component).
-  6. Test the web component inside Shadow DOM on a plain HTML page.
-  7. Licensing review, README attribution, publish to npm.
-  8. Later: cloud sharing.
+  9. Test the web component inside Shadow DOM on a plain HTML page.
+ 10. Licensing review, README attribution, publish to npm.
+ 11. Later: cloud sharing.
+
+
+10. BLOCK GEOMETRY AND RENDERING ACCURACY
+-----------------------------------------
+
+Decisions so far
+  - Stay Bedrock-native (Bedrock textures, Bedrock names/states) rather than
+    translating to Java models. Shulkr's public pages describe the opposite
+    approach (Java models, Bedrock mapped to Java "where possible", with
+    admitted inaccuracies for Bedrock-only blocks and some directional
+    states). Java models stay a possible later option.
+  - Geometry comes from a vendored, generated lookup (build script in the
+    repo, generated file committed), with hand-coded fallbacks for blocks
+    the data does not cover well. Revisit vendoring for the published npm
+    package (see licensing flag below).
+
+Data sources found (all inspected, not yet integrated)
+  1. PrismarineJS/minecraft-data, Bedrock edition:
+       data/bedrock/1.26.30/blockCollisionShapes.json (+ blockStates.json)
+     - blocks: name -> array of shape ids, one per state, in the same order
+       as blockStates.json for that block. Matches for all 1356 blocks.
+     - shapes: id -> list of boxes [x0,y0,z0,x1,y1,z1] in 0..1 space.
+     - Each block's state list is a clean cartesian product, so the array
+       index can be computed from a block's states (mixed radix over its
+       property order). A compact lookup is ~182 KB (~16 KB gzipped); the raw
+       blockStates.json is 5.5 MB and must not be shipped.
+     - 460 blocks have non-cube, non-empty shapes (stairs, slabs, trapdoors,
+       ladders, fences, walls, snow layers, beds, chests, cakes, hoppers...).
+     - It is COLLISION data, not render geometry:
+         * 219 blocks have empty collision in every state (saplings, flowers,
+           torches, rails, signs, pressure plates, levers, fire, redstone
+           wire, water, lava). Keep hand-coded shapes for these.
+         * All 32 door states return one identical slab (no facing, hinge or
+           open state). Keep doors hand-coded.
+         * Fences and gates are 1.5 tall (jump height): clamp to 1.0 for
+           drawing. Fence shape is the post only; arms stay our code.
+         * Some values look approximate (trapdoor 0.1825 vs vanilla 0.1875).
+     - It LAGS the game: it is the 1.26.30 snapshot; the newest game is
+       1.26.50.4. See "Version drift" below.
+  2. Mojang/bedrock-samples (official), cloned locally for inspection:
+       behavior_pack/shapes/*.json  - 218 official "minecraft:voxel_shape"
+         definitions (format 1.21.110), boxes in 0..16 pixel units. Included:
+         anvil, bell attachments (4), big_dripleaf (+tilts), cactus,
+         cake_bites_0..6, candle_cake, chest_type_single, composter + levels,
+         end_portal_frame_eye, fence, fence_gate(_in_wall)_occlusion,
+         grindstone, heavy_core, lectern, shelf facings, wall heads, slab top,
+         box_16xNx16 heights, and EVERY wall connection combination
+         (wall_<dir>_<low|tall>..._up). Officially these are culling/occlusion
+         shapes (the "culling_shape" block component), so treat them as
+         close-to-visual extents rather than guaranteed render models.
+       metadata/vanilladata_modules/mojang-blocks.json - the authoritative
+         list of 1463 blocks and 157 block properties with types and allowed
+         values (catalog saved as bedrock-block-properties.txt).
+       resource_pack/blocks.json + textures/terrain_texture.json - per-face
+         texture keys, per-state texture variant lists, "isotropic" flags.
+       resource_pack/textures/colormap/*.png - grass, foliage, birch,
+         evergreen, swamp and mangrove colormaps (biome tint sources).
+       resource_pack/textures/entity/* - chest, bed, sign, banner, bell,
+         shulker textures (block entities are drawn from entity models).
+       resource_pack/models/blocks/ - only 4 geometry files (two mushroom
+         shelves, two straw bed halves): there are no general block models.
+     - Repo LICENSE: "(c) Mojang AB. All rights reserved", subject to the
+       Minecraft EULA. See licensing flag.
+
+Version drift (important for the vendored lookup)
+  - bedrock-samples is 1.26.50.4 (15 Sep 2026); the minecraft-data collision
+    snapshot is 1.26.30. 121 blocks have different property sets. Causes:
+      * minecraft:corner (inner_left/inner_right/outer_left/outer_right)
+        added to stairs (97 blocks have it officially).
+      * minecraft:connection_north/south/east/west added to fences, panes and
+        bars (58 blocks officially).
+      * 121 official blocks (e.g. wool/concrete slabs and stairs) have no
+        shape entry at all.
+  - Design consequence: the generated lookup must tolerate property drift.
+    Compute the shape index using only the properties the dataset knows
+    about; ignore extra properties on the structure's block; default missing
+    ones to their first value. Name-pattern fallbacks (_stairs, _slab...)
+    remain for blocks with no entry.
+  - Structure files carry a palette "version" field, and older files use
+    older/legacy names and states (e.g. old_leaf_type, stone_slab_type).
+    mojang-blocks.json lists ~40 such legacy properties with zero blocks
+    using them; our legacy family table in blockTextures.js covers some.
+
+Accuracy backlog (what our renderer ignores today), by property family
+  Counts are blocks that use the property in the official data.
+  A. Orientation
+     - minecraft:corner (97): stair inner/outer corners not rendered.
+     - minecraft:cardinal_direction (98): used for doors/gates only.
+       Directional full cubes need per-face rotation of their textures
+       (furnace, dispenser, dropper, observer, piston, barrel, glazed
+       terracotta, carved pumpkin, loom, lectern, stonecutter, anvil...).
+       blocks.json fixes the "front" on one face (e.g. furnace front = south),
+       so the real facing has to rotate the faces.
+     - facing_direction int 0-5 (91): handled for ladder and button only.
+       Also hoppers, pistons, observers, end rods, wall signs, heads.
+     - direction int 0-3 (36): trapdoor only (also beds, bee nests).
+     - ground_sign_direction 0-15 (27): sign/hanging sign rotation.
+     - torch_facing_direction (10): wall torches are drawn upright today.
+     - Others: coral_direction, coral_fan_direction, lever_direction,
+       orientation (crafter, 12 values), minecraft:block_face (amethyst),
+       multi_face_direction_bits (glow lichen, sculk vein, resin clump: 64),
+       vine_direction_bits, attachment (bell, grindstone), portal_axis,
+       rotation (jigsaw), minecraft:facing_direction (observer).
+  B. Connections
+     - minecraft:connection_* (58): handled, but older structures lack them
+       (neighbor fallback applies, which over-connects).
+     - wall_connection_type_* none/short/tall (33) + wall_post_bit: we treat
+       short and tall the same and ignore the post bit. The official wall_*
+       voxel shapes cover all combinations exactly.
+     - in_wall_bit (13): gates sink 3 px when attached to walls.
+     - pale_moss_carpet_side_* (1), minecraft:corner (see A).
+  C. Toggle and part states
+     - upper_block_bit (32) and door_hinge_bit (22): door halves use
+       different textures (door_lower vs door_upper); hinge side and open
+       state mirror/rotate the panel. Both ignored today.
+     - open_bit (59): handled for trapdoor and gate only.
+     - lit (42): candles etc.; powered_bit (33); button_pressed_bit (15);
+       redstone_signal (20): pressure plates sink, wire color varies.
+     - head_piece_bit / occupied_bit: beds are two blocks drawn from entity
+       models; today they render as cubes.
+  D. Size and level states
+     - height (snow_layer, 8 levels), fill_level (cauldron), composter_fill_
+       level, bite_counter (cake), honey_level, moisturized_amount
+       (farmland), turtle_egg_count, cluster_count (sea pickle), candles 1-4,
+       books_stored (chiseled bookshelf), liquid_depth 0-15 (water, lava),
+       dripstone_thickness (pointed dripstone), bamboo stalk and leaf sizes.
+  E. Per-state texture variants (verified in terrain_texture.json)
+     - 258 terrain entries list several textures. resolveTextureKeyPath uses
+       the first one, so:
+         * crops always show stage 0: wheat (8 stages), carrots (4),
+           beetroot, nether_wart (4), cocoa (3), sweet berry bush, stems.
+         * candles never show the lit texture ([candle, candle_lit]).
+         * cake side and "inner" faces use the first entry.
+     - Which state picks which index is not stored in the files. We need a
+       small hand-written table: block -> state key -> texture index
+       (growth, age, lit, bite_counter...).
+  F. Tint and render hints
+     - terrain_texture.json flags tint only for waterlily; grass, foliage,
+       water and redstone tints are engine behavior driven by biome. We need
+       a hardcoded table of tinted blocks plus a default biome choice
+       (structures carry no biome data), using resource_pack colormap PNGs.
+     - blocks.json "isotropic" (155 blocks): the game randomly rotates some
+       face textures for a less tiled look. Cosmetic, low priority.
+     - Render layers (opaque / alpha test / blend) are not in blocks.json;
+       glass and water need real blending and sorting (currently alphaTest).
+  G. Block entities
+     - chests, beds, signs, banners, heads, shulker boxes, bells, lecterns,
+       enchanting tables, and similar use entity models and entity textures,
+       not block geometry. Best handled as simplified box approximations
+       using the official voxel shapes plus entity textures, later.
+
+Suggested priority (highest visual impact per effort first)
+  1. Directional full cubes: rotate face textures by facing/cardinal
+     direction (furnaces, pistons, observers, barrels, glazed terracotta).
+  2. Stair corners (minecraft:corner) and wall connection heights/post bit.
+  3. Door halves (upper_block_bit texture), hinge and open state.
+  4. Per-state texture variants: crops, candles (lit), cake, cocoa.
+  5. Water/lava level, snow layers, cauldrons, composters (shapes + level).
+  6. Wall-mounted torches, levers, signs (hand-coded or voxel shapes).
+  7. Biome tint table (grass, foliage, water) with a chosen default biome.
+  8. Block entities (chest, bed, sign, head, banner) as simplified shapes.
+
+Licensing flag (revisit before publishing)
+  - The bedrock-samples repository is "All rights reserved" under Mojang's
+    EULA. Our runtime texture fetch does not redistribute it. A vendored
+    lookup generated from Mojang's files (or from minecraft-data, whose
+    content derives from game data) WOULD ship derived data inside the
+    package. That is fine to try in the local workshop, but needs a licensing
+    decision before it ships in the npm package. Options: keep the generated
+    file out of the published package and have the component fetch or accept
+    it at runtime; or confirm the terms allow redistribution. Not legal
+    advice; check the actual terms.
+
+
+11. LAYER SLICING (PLAN MODE)
+-----------------------------
+
+Idea borrowed from Shulkr's viewer, which offers a layer-by-layer view
+sliced along any axis.
+
+Design
+  - A workshop control: choose an axis (X, Y or Z) and a range (min, max) or
+    a single layer, with a "show all" reset.
+  - Implementation is a filter on the block list before grouping:
+    keep blocks with min <= coordinate <= max, then run the same
+    groupTexturedBlocks / untextured logic.
+  - Keep centering and camera framing based on the FULL structure size so the
+    view does not jump while sliding the range.
+  - Neighbor-based connection fallback should still look at the full block
+    lookup (not just the sliced blocks) so fences and panes near the cut do
+    not change shape.
+  - Optional later: "peel down" mode (show everything at or below layer N),
+    and highlighting the current layer with the rest dimmed.
+  - Lives in the workshop UI; StructureViewer gets an optional
+    sliceFilter prop (or accepts pre-filtered blocks) so the web component
+    can reuse it.

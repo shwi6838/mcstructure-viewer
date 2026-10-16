@@ -1,25 +1,29 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Canvas } from "@react-three/fiber";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import { parseMcstructureFile } from "../lib/parseMcstructure";
 import { colorForBlock } from "../lib/blockColors";
 import {
   loadBlockTextureAtlas,
   buildTexturedBoxGeometry,
 } from "../lib/blockTextures";
+import { buildShapeGeometry, applyPillarAxis } from "../lib/blockShapes";
 import {
-  getShapeCategory,
-  getOrientationSignature,
-  buildShapeGeometry,
-  applyPillarAxis,
-} from "../lib/blockShapes";
-
-function centerOffset(size) {
-  return { x: -size.x / 2, y: -size.y / 2, z: -size.z / 2 };
-}
+  centerOffset,
+  buildBlockLookup,
+  findUntexturedBlocks,
+  countBlockNames,
+  groupTexturedBlocks,
+} from "../lib/structureLayout";
 
 function placeInstances(meshRef, blocks, size) {
   if (!meshRef.current) return;
@@ -35,6 +39,51 @@ function placeInstances(meshRef, blocks, size) {
     meshRef.current.setMatrixAt(i, dummy.matrix);
   });
   meshRef.current.instanceMatrix.needsUpdate = true;
+}
+
+// Viewing direction used when framing: a slightly raised corner view.
+const FRAME_DIRECTION = new THREE.Vector3(1, 0.8, 1).normalize();
+// Extra breathing room around the structure (1 = touching the edges).
+const FRAME_MARGIN = 1.15;
+
+/**
+ * Positions the camera so the whole structure fits in view, and aims the
+ * orbit controls at its center. Re-runs when a new structure loads or when
+ * `resetKey` changes. It deliberately does NOT re-run on resize, so it
+ * won't undo the user's orbiting.
+ */
+function AutoFrame({ size, resetKey }) {
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls);
+  const get = useThree((state) => state.get);
+
+  useEffect(() => {
+    // OrbitControls (makeDefault) registers itself after first render;
+    // this effect re-runs once it's available.
+    if (!controls) return;
+
+    const viewport = get().size;
+    const aspect = viewport.width / Math.max(1, viewport.height);
+
+    const radius =
+      0.5 * Math.sqrt(size.x * size.x + size.y * size.y + size.z * size.z);
+
+    const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+    const fitFov = Math.min(verticalFov, horizontalFov);
+
+    const distance = (radius / Math.sin(fitFov / 2)) * FRAME_MARGIN;
+
+    camera.position.copy(FRAME_DIRECTION).multiplyScalar(distance);
+    camera.near = 0.1;
+    camera.far = Math.max(1000, distance * 10);
+    camera.updateProjectionMatrix();
+
+    controls.target.set(0, 0, 0);
+    controls.update();
+  }, [size, resetKey, controls, camera, get]);
+
+  return null;
 }
 
 // One InstancedMesh per (shape category, orientation, connection pattern,
@@ -105,223 +154,121 @@ function FallbackColorBlocks({ blocks, size }) {
   );
 }
 
-export default function StructureViewer() {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(false);
+/**
+ * Shared structure viewer - used by the workshop and (later) the embeddable
+ * component. It renders only the 3D scene; all surrounding UI (file input,
+ * stats, lists) belongs to the host.
+ *
+ * Props
+ *   data      Parsed structure from parseMcstructureFile:
+ *             { size: {x,y,z}, blocks: [...] }. Pass null for an empty scene.
+ *   onStatus  Optional callback, called whenever texture state changes, with:
+ *             { texturesLoading, textureError, texturedCount,
+ *               untexturedCount, untexturedCounts: [[name, count], ...] }
+ *   style, className   Applied to the root element.
+ *
+ * Sizing
+ *   Fills its parent (width/height 100%). The parent must have a size; the
+ *   canvas tracks it automatically as it changes.
+ *
+ * Ref handle
+ *   resetView()  Re-frames the camera on the whole structure.
+ */
+const StructureViewer = forwardRef(function StructureViewer(
+  { data = null, onStatus, style, className },
+  ref
+) {
   const [textureAssets, setTextureAssets] = useState(null);
   const [texturesLoading, setTexturesLoading] = useState(false);
-  const [showUntextured, setShowUntextured] = useState(false);
+  const [textureError, setTextureError] = useState(null);
+  const [resetKey, setResetKey] = useState(0);
 
-  async function handleFile(file) {
-    setLoading(true);
-    setError(null);
-    setData(null);
+  useImperativeHandle(
+    ref,
+    () => ({ resetView: () => setResetKey((k) => k + 1) }),
+    []
+  );
+
+  // Load textures whenever a new structure arrives. The cancelled flag
+  // keeps a slow load for an old structure from overwriting a newer one.
+  useEffect(() => {
     setTextureAssets(null);
-    setShowUntextured(false);
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const parsed = await parseMcstructureFile(arrayBuffer);
-      if (parsed.blocks.length === 0) {
-        setError("Parsed the file, but found no blocks to render.");
-        return;
-      }
-      setData(parsed);
-
-      setTexturesLoading(true);
-      try {
-        const assets = await loadBlockTextureAtlas(parsed.blocks);
-        setTextureAssets(assets);
-      } catch (textureErr) {
-        console.error("Falling back to flat colors:", textureErr);
-      } finally {
-        setTexturesLoading(false);
-      }
-    } catch (err) {
-      console.error(err);
-      setError(
-        "Could not parse this file. Confirm it's an uncompressed .mcstructure export."
-      );
-    } finally {
-      setLoading(false);
+    setTextureError(null);
+    if (!data) {
+      setTexturesLoading(false);
+      return;
     }
-  }
 
-  // Fast neighbor lookup for connection-aware shapes (currently just
-  // panes/bars). Keyed by "x,y,z" - presence in this map means "there's
-  // some block here", not specifically a matching/sturdy one, which is a
-  // simplification of vanilla's real connection rules.
-  const blockLookup = useMemo(() => {
-    if (!data) return null;
-    const map = new Map();
-    data.blocks.forEach((b) => map.set(`${b.x},${b.y},${b.z}`, b));
-    return map;
+    let cancelled = false;
+    setTexturesLoading(true);
+    loadBlockTextureAtlas(data.blocks)
+      .then((assets) => {
+        if (!cancelled) setTextureAssets(assets);
+      })
+      .catch((err) => {
+        console.error("Falling back to flat colors:", err);
+        if (!cancelled) setTextureError(err);
+      })
+      .finally(() => {
+        if (!cancelled) setTexturesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [data]);
 
-  function getConnections(block) {
-    const s = block.states || {};
+  const blockLookup = useMemo(
+    () => (data ? buildBlockLookup(data.blocks) : null),
+    [data]
+  );
 
-    // Modern fences/panes/bars store their own connection booleans - more
-    // accurate than inferring from neighbors, since it reflects exactly
-    // what the game decided was connectable.
-    const hasPaneConnections =
-      "minecraft:connection_north" in s ||
-      "minecraft:connection_south" in s ||
-      "minecraft:connection_east" in s ||
-      "minecraft:connection_west" in s;
-    if (hasPaneConnections) {
-      return {
-        north: !!s["minecraft:connection_north"],
-        south: !!s["minecraft:connection_south"],
-        east: !!s["minecraft:connection_east"],
-        west: !!s["minecraft:connection_west"],
-      };
+  const fallbackBlocks = useMemo(
+    () => (data ? findUntexturedBlocks(data.blocks, textureAssets) : []),
+    [data, textureAssets]
+  );
+
+  const untexturedCounts = useMemo(
+    () => countBlockNames(fallbackBlocks),
+    [fallbackBlocks]
+  );
+
+  const texturedGroups = useMemo(
+    () =>
+      data ? groupTexturedBlocks(data.blocks, textureAssets, blockLookup) : [],
+    [data, textureAssets, blockLookup]
+  );
+
+  // Report texture status to the host. The callback lives in a ref so an
+  // inline function from the parent doesn't retrigger this effect.
+  const onStatusRef = useRef(onStatus);
+  onStatusRef.current = onStatus;
+
+  useEffect(() => {
+    if (!data) {
+      onStatusRef.current?.(null);
+      return;
     }
-
-    // Walls use a per-side type (e.g. "none"/"short"/"tall") rather than a
-    // plain boolean - treat anything other than "none" as connected.
-    const hasWallConnections =
-      "wall_connection_type_north" in s ||
-      "wall_connection_type_south" in s ||
-      "wall_connection_type_east" in s ||
-      "wall_connection_type_west" in s;
-    if (hasWallConnections) {
-      return {
-        north: !!s.wall_connection_type_north && s.wall_connection_type_north !== "none",
-        south: !!s.wall_connection_type_south && s.wall_connection_type_south !== "none",
-        east: !!s.wall_connection_type_east && s.wall_connection_type_east !== "none",
-        west: !!s.wall_connection_type_west && s.wall_connection_type_west !== "none",
-      };
-    }
-
-    // Fallback for older/legacy blocks without explicit connection states:
-    // infer from simple neighbor presence.
-    return {
-      north: blockLookup.has(`${block.x},${block.y},${block.z - 1}`),
-      south: blockLookup.has(`${block.x},${block.y},${block.z + 1}`),
-      east: blockLookup.has(`${block.x + 1},${block.y},${block.z}`),
-      west: blockLookup.has(`${block.x - 1},${block.y},${block.z}`),
-    };
-  }
-
-  const fallbackBlocks = useMemo(() => {
-    if (!data) return [];
-    if (!textureAssets) return data.blocks; // nothing textured yet
-    return data.blocks.filter((b) => !textureAssets.getFaceUVs(b));
-  }, [data, textureAssets]);
-
-  // Breakdown of untextured blocks by name, for the "show untextured
-  // blocks" toggle - sorted most-common first.
-  const untexturedCounts = useMemo(() => {
-    const counts = new Map();
-    for (const b of fallbackBlocks) {
-      counts.set(b.name, (counts.get(b.name) || 0) + 1);
-    }
-    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [fallbackBlocks]);
-
-  // Group textured blocks by (shape category, orientation, connection
-  // pattern, exact UV set) so each group can use one shared geometry.
-  const texturedGroups = useMemo(() => {
-    if (!data || !textureAssets || !blockLookup) return [];
-    const groups = new Map();
-    for (const block of data.blocks) {
-      const faceUVs = textureAssets.getFaceUVs(block);
-      if (!faceUVs) continue;
-      const category = getShapeCategory(block.name);
-
-      let connections = null;
-      let connectionKey = "";
-      if (
-        category === "thin_post" ||
-        category === "fence_post" ||
-        category === "wall_post"
-      ) {
-        connections = getConnections(block);
-        connectionKey = `${connections.north ? 1 : 0}${connections.south ? 1 : 0}${
-          connections.east ? 1 : 0
-        }${connections.west ? 1 : 0}`;
-      }
-
-      const orientationKey = getOrientationSignature(category, block.states);
-
-      const key = `${category}::${connectionKey}::${orientationKey}::${JSON.stringify(
-        faceUVs
-      )}`;
-      if (!groups.has(key)) {
-        groups.set(key, {
-          key,
-          category,
-          connections,
-          states: block.states,
-          faceUVs,
-          blocks: [],
-        });
-      }
-      groups.get(key).blocks.push(block);
-    }
-    return Array.from(groups.values());
-  }, [data, textureAssets, blockLookup]);
+    onStatusRef.current?.({
+      texturesLoading,
+      textureError,
+      texturedCount: data.blocks.length - fallbackBlocks.length,
+      untexturedCount: fallbackBlocks.length,
+      untexturedCounts,
+    });
+  }, [data, texturesLoading, textureError, fallbackBlocks, untexturedCounts]);
 
   return (
-    <div style={{ width: "100%", height: "100vh", position: "relative" }}>
-      <div
-        style={{
-          position: "absolute",
-          zIndex: 10,
-          padding: 16,
-          background: "rgba(255,255,255,0.9)",
-          borderRadius: 8,
-          margin: 16,
-          maxWidth: 320,
-          maxHeight: "80vh",
-          overflowY: "auto",
-        }}
-      >
-        <input
-          type="file"
-          accept=".mcstructure"
-          onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])}
-        />
-        {loading && <p>Parsing structure…</p>}
-        {error && <p style={{ color: "crimson" }}>{error}</p>}
-        {data && (
-          <p>
-            {data.blocks.length.toLocaleString()} blocks · {data.size.x}×
-            {data.size.y}×{data.size.z}
-          </p>
-        )}
-        {texturesLoading && <p>Loading textures from bedrock-samples…</p>}
-        {data && textureAssets && (
-          <>
-            <p>
-              {(data.blocks.length - fallbackBlocks.length).toLocaleString()}{" "}
-              blocks textured · {fallbackBlocks.length.toLocaleString()} shown
-              as color
-            </p>
-            {fallbackBlocks.length > 0 && (
-              <button onClick={() => setShowUntextured((v) => !v)}>
-                {showUntextured ? "Hide" : "Show"} untextured block names
-              </button>
-            )}
-            {showUntextured && (
-              <ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
-                {untexturedCounts.map(([name, count]) => (
-                  <li key={name}>
-                    {name} × {count.toLocaleString()}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </>
-        )}
-      </div>
-
+    <div
+      className={className}
+      style={{ position: "relative", width: "100%", height: "100%", ...style }}
+    >
       <Canvas camera={{ position: [20, 20, 20], fov: 50 }}>
         <ambientLight intensity={0.6} />
         <directionalLight position={[10, 20, 10]} intensity={1} />
         {data && (
           <>
+            <AutoFrame size={data.size} resetKey={resetKey} />
             {texturedGroups.map(
               ({ key, category, connections, states, faceUVs, blocks }) => (
                 <TexturedBlockGroup
@@ -343,8 +290,10 @@ export default function StructureViewer() {
             />
           </>
         )}
-        <OrbitControls />
+        <OrbitControls makeDefault />
       </Canvas>
     </div>
   );
-}
+});
+
+export default StructureViewer;

@@ -90,17 +90,26 @@ and fall back to "is there a neighbor block on that side" for older blocks.
 - Blocks with no resolved texture render as flat-colored cubes
   (`lib/blockColors.js`: substring color map plus a deterministic hashed
   color for unknown names).
-- The info panel shows block count, dimensions, how many blocks are
-  textured vs. shown as color, and a toggle listing the untextured block
-  names by frequency, which is useful for deciding which blocks to support
-  next.
+- `StructureViewer` renders only the 3D scene. It takes a parsed structure
+  via a `data` prop, fills its parent container (no hard-coded `100vh`), loads
+  textures itself, reports texture stats through an `onStatus` callback, and
+  exposes `resetView()` through a ref. It contains no file input or stats UI.
+- The workshop wrapper (`components/ViewerWorkshop.jsx`) adds the debug UI
+  around it: file input, block count and dimensions, textured vs. color
+  counts, a toggle listing untextured block names by frequency (useful for
+  deciding which blocks to support next), and a "Reset view" button.
+- **Auto-framing:** when a structure loads, the camera is placed so the whole
+  build fits the viewport (bounding sphere vs. the narrower of the vertical
+  and horizontal field of view, with a small margin) and the orbit target is
+  set to the structure's center. A "Reset view" button re-frames after
+  orbiting. Window resizes don't re-frame, so manual camera moves aren't undone.
 - Orbit camera via `@react-three/drei`'s `OrbitControls`.
 
 ### App shell
 
 - `app/page.js`: placeholder home page ("My Bedrock builds") linking to the
   viewer; intended to become a gallery of saved builds.
-- `app/viewer/page.js`: client component that loads the viewer with
+- `app/viewer/page.js`: client component that loads `ViewerWorkshop` with
   `dynamic(..., { ssr: false })`, since three.js needs the browser.
 - `app/layout.js`: root layout and metadata.
 
@@ -113,9 +122,11 @@ app/
   viewer/
     page.js              # route entry; renders StructureViewer (ssr: false)
 components/
-  StructureViewer.jsx    # canvas, file input, grouping, instancing, UI panel
-lib/
+  StructureViewer.jsx    # shared 3D viewer: scene, auto-framing, instancing
+  ViewerWorkshop.jsx     # workshop-only UI: file input, stats, untextured list
+lib/                     # shared core engine (no React/Next imports)
   parseMcstructure.js    # NBT -> { size, blocks }
+  structureLayout.js     # centering, connections, grouping, untextured counts
   blockTextures.js       # fetch textures, build atlas, resolve face UVs
   blockShapes.js         # shape categories and geometry builders
   blockColors.js         # flat-color fallback
@@ -129,8 +140,6 @@ lib/
   so waterlogged blocks and water-in-layer-1 won't appear.
 - **No block entities.** Chests, signs, banners, and similar data in
   `block_position_data` isn't read.
-- **No auto-framing.** The camera starts at a fixed position instead of
-  fitting the structure's bounding box.
 - **No biome tinting.** Grass and leaves use the untinted base texture.
 - **No face culling or transparency sorting.** Every block face is drawn, and
   translucent blocks such as glass and water use `alphaTest` cutout rather
@@ -216,11 +225,16 @@ component).
 
 ### 4. Viewer improvements
 
-- Auto-fit the camera to the structure's bounding box.
+- **Data-driven block shapes:** generate a vendored lookup from Bedrock
+  collision-shape data, keeping hand-coded shapes as fallbacks for blocks the
+  data doesn't cover (plants, torches, rails, doors, connection arms).
+- **Layer slicing (plan mode):** view a structure one layer or range at a
+  time along any axis.
+- **Rendering accuracy** (full backlog in `PLANNING.txt`): directional block
+  textures, stair corners, wall heights, door halves and hinges, per-state
+  textures (crops, lit candles), snow and liquid levels, wall-mounted torches,
+  biome tint, and block entities such as chests, beds and signs.
 - Read layer 1 for waterlogging and render water.
 - Hidden-face culling for large builds.
-- Biome tinting for grass and foliage.
-- More block shapes and texture mappings, prioritized from the untextured
-  block list.
 
 Detailed planning notes live in [`PLANNING.txt`](./PLANNING.txt).
